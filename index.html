@@ -293,6 +293,27 @@
 
 <script>
 (function(){
+  // Persistence: prefer a host-provided async storage API (used by the
+  // preview sandbox this app was authored in); otherwise fall back to the
+  // browser's localStorage so saving/history works anywhere — e.g. when
+  // served from GitHub Pages. Same async {set,get,list,delete} contract.
+  const storage = (typeof window !== 'undefined' && window.storage) ? window.storage : {
+    async set(key, value){ localStorage.setItem(key, value); },
+    async get(key){
+      const value = localStorage.getItem(key);
+      return value == null ? null : { value };
+    },
+    async list(prefix){
+      const keys = [];
+      for(let i = 0; i < localStorage.length; i++){
+        const k = localStorage.key(i);
+        if(k && k.startsWith(prefix)) keys.push(k);
+      }
+      return { keys };
+    },
+    async delete(key){ localStorage.removeItem(key); }
+  };
+
   const timerEl = document.getElementById('timer');
   const timerLabel = document.getElementById('timerLabel');
   const startBtn = document.getElementById('startBtn');
@@ -438,7 +459,7 @@
       bestLapMs: lapTimes.length ? Math.min(...lapTimes) : null
     };
     try{
-      await window.storage.set('skate-session:' + session.id, JSON.stringify(session));
+      await storage.set('skate-session:' + session.id, JSON.stringify(session));
     } catch(e){ console.error('Save failed', e); }
     await loadHistory();
     resetBtn.onclick();
@@ -446,7 +467,7 @@
 
   async function loadHistory(){
     try{
-      const listResult = await window.storage.list('skate-session:');
+      const listResult = await storage.list('skate-session:');
       const keys = (listResult && listResult.keys) ? listResult.keys : [];
       if(keys.length === 0){
         historyList.innerHTML = '<div class="empty">No sessions yet — finish one to see it here.</div>';
@@ -456,7 +477,7 @@
       const sessions = [];
       for(const k of keys){
         try{
-          const res = await window.storage.get(k);
+          const res = await storage.get(k);
           if(res && res.value) sessions.push(JSON.parse(res.value));
         } catch(e){ /* skip missing */ }
       }
@@ -483,7 +504,7 @@
       historyList.querySelectorAll('.hist-del').forEach(btn => {
         btn.addEventListener('click', async (e) => {
           const id = e.currentTarget.getAttribute('data-id');
-          try{ await window.storage.delete('skate-session:' + id); } catch(err){}
+          try{ await storage.delete('skate-session:' + id); } catch(err){}
           loadHistory();
         });
       });
