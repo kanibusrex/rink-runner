@@ -296,7 +296,7 @@
       <svg viewBox="0 0 400 240">
         <ellipse class="track-bg" cx="200" cy="120" rx="170" ry="90"/>
         <ellipse id="trackProgress" class="track-progress" cx="200" cy="120" rx="170" ry="90"
-          pathLength="100" stroke-dasharray="0 100" transform="rotate(-90 200 120)"/>
+          pathLength="100" stroke-dasharray="0 100" transform="translate(400,0) scale(-1,1) rotate(-90 200 120)"/>
         <circle id="skaterDot" class="skater-dot" cx="370" cy="120" r="9"/>
       </svg>
       <div class="rink-center">
@@ -480,8 +480,9 @@
   }
 
   function setDotPosition(fraction){
-    // parametric ellipse position for a fraction [0,1) around the loop, start at angle -90 (top)... but visually starting at right (0deg) to match dasharray rotate
-    const angle = fraction * 2 * Math.PI;
+    // parametric ellipse position for a fraction [0,1) around the loop, starting at the right (0deg).
+    // negative angle sweeps the dot counter-clockwise (right -> top -> left -> bottom).
+    const angle = -fraction * 2 * Math.PI;
     const cx = 200, cy = 120;
     const x = cx + rx * Math.cos(angle);
     const y = cy + ry * Math.sin(angle);
