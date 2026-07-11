@@ -458,6 +458,14 @@
   const STRIDE_PEAK = 2.4, STRIDE_RESET = 0.8, MIN_STRIDE_MS = 260;
   let strideCount = 0, strideArmed = false, lastStrideTime = 0;
 
+  // ---- Screen Wake Lock ----
+  // Keep the screen awake during a session so the phone can be set down
+  // (armband / ledge / pocket) without locking — no need to hold it or tap to
+  // keep it on. NOTE: a web page can't run with the screen fully OFF on iOS
+  // (the OS suspends it), so this keeps the screen ON rather than enabling
+  // true background tracking, which would need a native app.
+  let wakeLock = null;
+
   function haversineMeters(a, b){
     const R = 6371000, toRad = d => d*Math.PI/180;
     const dLat = toRad(b.lat - a.lat), dLon = toRad(b.lon - a.lon);
@@ -615,6 +623,7 @@
     lapBtn.disabled = false;
     timerLabel.textContent = 'Skating…';
     if(gpsEnabled) startGps();
+    requestWakeLock();
     tick();
   }
 
@@ -627,6 +636,7 @@
     startBtn.textContent = 'Resume';
     timerLabel.textContent = auto ? 'Auto-paused — still' : 'Paused';
     if(gpsEnabled){ stopGps(); setGpsStatus('Paused — GPS idle', 'acquiring'); }
+    releaseWakeLock();
   }
 
   startBtn.onclick = () => {
@@ -649,6 +659,7 @@
     lapTimes = [];
     lastLapMark = 0;
     stopGps();
+    releaseWakeLock();
     gpsDistanceMeters = 0;
     lapAnchor = null; leftAnchor = false; lastAutoLapTime = 0;
     strideCount = 0; strideArmed = false; lastStrideTime = 0;
@@ -976,6 +987,32 @@
     updateStrideRowVisibility();
     updateStats();
   }
+
+  async function requestWakeLock(){
+    if(!('wakeLock' in navigator)) return;
+    try{
+      wakeLock = await navigator.wakeLock.request('screen');
+      // The browser releases the lock whenever the page is hidden; note that.
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    }catch(e){ /* denied or page not visible — session still runs, screen may sleep */ }
+  }
+  async function releaseWakeLock(){
+    try{ if(wakeLock) await wakeLock.release(); }catch(e){}
+    wakeLock = null;
+  }
+
+  // Returning to the tab (unlock / re-focus): the browser auto-released the
+  // wake lock and paused rAF while hidden, so re-acquire and resume the loop.
+  // The timer is wall-clock based (Date.now), so elapsed time stays correct
+  // across the gap — but laps/GPS/strides during a screen-off gap are lost.
+  document.addEventListener('visibilitychange', () => {
+    if(document.visibilityState === 'visible' && running){
+      requestWakeLock();
+      cancelAnimationFrame(rafId);
+      tick();
+      updateStats();
+    }
+  });
 
   setDotPosition(0);
   updateStats();
