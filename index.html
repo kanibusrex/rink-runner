@@ -263,6 +263,8 @@
   .gps-status.acquiring .dot{animation:gpspulse 1s ease-in-out infinite;}
   @keyframes gpspulse{0%,100%{opacity:1;}50%{opacity:0.25;}}
   .settings.muted{opacity:0.45;}
+  /* .settings sets display:flex, which beats the UA [hidden] rule — restore it. */
+  .settings[hidden]{display:none;}
   .gps-badge{
     display:inline-block;font-family:'IBM Plex Mono',monospace;font-size:8px;
     letter-spacing:0.08em;text-transform:uppercase;color:var(--cyan);
@@ -320,8 +322,8 @@
     </div>
 
     <div class="settings" id="lapLenRow">
-      <label for="lapLength">Rink lap length (ft)</label>
-      <input type="number" id="lapLength" value="200" min="20" max="1600" step="5">
+      <label for="lapLength">Rink lap length (ft, optional)</label>
+      <input type="number" id="lapLength" placeholder="GPS can measure" min="20" max="1600" step="5">
     </div>
 
     <div class="settings">
@@ -428,6 +430,14 @@
   let lapAnchor = null;         // {lat, lon} recorded at the start of the session
   let leftAnchor = false;
   let lastAutoLapTime = 0;
+  let lapStartDistanceM = 0;    // gpsDistanceMeters when the current lap began
+
+  // ---- Auto-measured rink lap length ----
+  // Derived from the GPS distance of completed laps, then persisted so it's
+  // reused indoors. lapLengthAuto stays true until the user types their own
+  // value, so we never overwrite a hand-entered number.
+  let measuredSum = 0, measuredCount = 0, measuredLapLengthFt = 0;
+  let lapLengthAuto = true;
 
   // ---- Motion auto-detect + stride counting ----
   // Optional: use the accelerometer (DeviceMotion) to auto-start when you begin
@@ -479,7 +489,9 @@
     gpsLastCoords = cur;
     if(running) maybeAutoLapGps(cur);
     if(gpsEnabled) updateStats();
-    setGpsStatus('GPS active · ±' + Math.round(accuracy || 0) + 'm', 'active');
+    let gmsg = 'GPS active · ±' + Math.round(accuracy || 0) + 'm';
+    if(measuredLapLengthFt > 0) gmsg += ' · lap ≈ ' + Math.round(measuredLapLengthFt) + ' ft';
+    setGpsStatus(gmsg, 'active');
   }
   function onGpsError(err){
     let msg = 'GPS unavailable — laps still work';
@@ -566,7 +578,13 @@
   }
 
   function updateStats(){
-    statDistance.textContent = currentDistanceFeet().toFixed(0);
+    const lapLen = parseFloat(lapLengthInput.value) || 0;
+    // Distance is only meaningful when we have a source: GPS, counted strides,
+    // or (manual mode) a lap length with laps logged.
+    const distanceKnown = gpsEnabled
+      || (motionEnabled && motionSupported && strideCount > 0)
+      || (lapLen > 0 && lapTimes.length > 0);
+    statDistance.textContent = distanceKnown ? currentDistanceFeet().toFixed(0) : '—';
     if(lapTimes.length){
       const avg = lapTimes.reduce((a,b)=>a+b,0)/lapTimes.length;
       statAvgLap.textContent = fmtLap(avg);
@@ -584,6 +602,7 @@
     if(elapsedMs === 0){
       lapAnchor = null; leftAnchor = false; lastAutoLapTime = 0;
       strideCount = 0; strideArmed = false; lastStrideTime = 0;
+      lapStartDistanceM = 0; measuredSum = 0; measuredCount = 0;
     }
     running = true;
     startTime = Date.now() - elapsedMs;
@@ -633,6 +652,7 @@
     gpsDistanceMeters = 0;
     lapAnchor = null; leftAnchor = false; lastAutoLapTime = 0;
     strideCount = 0; strideArmed = false; lastStrideTime = 0;
+    lapStartDistanceM = 0; measuredSum = 0; measuredCount = 0;
     manualPaused = false; pausedByAuto = false;
     movingSince = 0; stillSince = 0; movingState = false;
     timerEl.textContent = '00:00';
@@ -722,7 +742,6 @@
   gpsToggle.addEventListener('change', async () => {
     gpsEnabled = gpsToggle.checked;
     try{ await storage.set('skate-setting:gps', gpsEnabled ? '1' : '0'); }catch(e){}
-    lapLenRow.classList.toggle('muted', gpsEnabled);
     if(gpsEnabled){
       if(running) startGps();
       else setGpsStatus('GPS ready — auto distance + laps', 'acquiring');
@@ -734,16 +753,36 @@
     updateStats();
   });
 
+  // Typing a lap length makes it user-owned — stop auto-measuring/overwriting it.
+  lapLengthInput.addEventListener('input', () => {
+    lapLengthAuto = false;
+    measuredLapLengthFt = 0;
+    persistLapLength();
+    updateStats();
+  });
+
+  async function initLapLength(){
+    try{
+      const v = await storage.get('skate-setting:lapLength');
+      if(v && v.value != null && v.value !== '') lapLengthInput.value = v.value;
+      const a = await storage.get('skate-setting:lapLengthAuto');
+      lapLengthAuto = !(a && a.value === '0');
+      // Restore the measured estimate so GPS mode can show it right away.
+      if(lapLengthAuto && lapLengthInput.value) measuredLapLengthFt = parseFloat(lapLengthInput.value) || 0;
+    }catch(e){}
+    updateStats();
+  }
+
   async function initGpsSetting(){
     try{
       const res = await storage.get('skate-setting:gps');
       if(res && res.value === '1'){
         gpsToggle.checked = true;
         gpsEnabled = true;
-        lapLenRow.classList.add('muted');
         setGpsStatus('GPS ready — auto distance + laps', 'acquiring');
       }
     }catch(e){}
+    updateStrideRowVisibility();
     updateStats();
   }
 
@@ -756,21 +795,37 @@
   }
   function hideMotionStatus(){ motionStatus.hidden = true; }
 
+  function updateLapLenRowVisibility(){
+    // Lap length only matters as a distance source in pure manual mode
+    // (no GPS, no motion). Hide it otherwise so we don't ask for a number
+    // that isn't used — GPS/stride distance don't need it.
+    lapLenRow.hidden = gpsEnabled || (motionEnabled && motionSupported);
+  }
   function updateStrideRowVisibility(){
     // Stride-length calibration only matters for indoor hands-free distance:
     // motion on, GPS off.
     strideLenRow.hidden = !(motionEnabled && !gpsEnabled && motionSupported);
+    updateLapLenRowVisibility();
   }
 
-  // ---- GPS geofence auto-lap ----
+  // ---- GPS geofence auto-lap (+ auto-measure of lap length) ----
   function maybeAutoLapGps(cur){
-    if(!lapAnchor){ lapAnchor = cur; leftAnchor = false; return; }
+    if(!lapAnchor){ lapAnchor = cur; leftAnchor = false; lapStartDistanceM = gpsDistanceMeters; return; }
     const d = haversineMeters(lapAnchor, cur);
     if(!leftAnchor){
       if(d > LEAVE_RADIUS) leftAnchor = true;
     } else if(d < ENTER_RADIUS){
       const now = Date.now();
       if(now - lastAutoLapTime > MIN_AUTO_LAP_MS){
+        // Measure this lap from the GPS distance covered since the last lap and
+        // fold it into a running average — but only while the length is still
+        // auto (the user hasn't typed their own), and only if it's plausible.
+        const lapFt = (gpsDistanceMeters - lapStartDistanceM) * M_TO_FT;
+        lapStartDistanceM = gpsDistanceMeters;
+        if(lapLengthAuto && lapFt >= 30 && lapFt <= 5000){
+          measuredSum += lapFt; measuredCount++;
+          setMeasuredLapLength(measuredSum / measuredCount);
+        }
         const lapDur = elapsedMs - lastLapMark;
         lapTimes.push(lapDur > 0 ? lapDur : 0);
         lastLapMark = elapsedMs;
@@ -779,6 +834,17 @@
         updateStats();
       }
     }
+  }
+  function setMeasuredLapLength(ft){
+    measuredLapLengthFt = ft;
+    lapLengthInput.value = Math.round(ft);   // fills the (hidden) field for indoor reuse
+    persistLapLength();
+  }
+  async function persistLapLength(){
+    try{
+      await storage.set('skate-setting:lapLength', lapLengthInput.value || '');
+      await storage.set('skate-setting:lapLengthAuto', lapLengthAuto ? '1' : '0');
+    }catch(e){}
   }
 
   // ---- Stride counting (indoor hands-free distance + derived laps) ----
@@ -914,6 +980,7 @@
   setDotPosition(0);
   updateStats();
   loadHistory();
+  initLapLength();
   initGpsSetting();
   initMotionSetting();
 })();
