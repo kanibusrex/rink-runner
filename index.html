@@ -332,6 +332,20 @@
       </label>
     </div>
     <div class="gps-status" id="gpsStatus" hidden><span class="dot"></span><span id="gpsStatusText"></span></div>
+
+    <div class="settings">
+      <label for="motionToggle">Auto-detect skating (motion)</label>
+      <label class="switch">
+        <input type="checkbox" id="motionToggle" aria-describedby="motionStatus">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="gps-status" id="motionStatus" hidden><span class="dot"></span><span id="motionStatusText"></span></div>
+
+    <div class="settings" id="strideLenRow" hidden>
+      <label for="strideLen">Stride length (ft) — hands-free distance</label>
+      <input type="number" id="strideLen" value="5" min="1" max="20" step="0.5">
+    </div>
   </div>
 
   <div class="history">
@@ -381,6 +395,11 @@
   const gpsStatus = document.getElementById('gpsStatus');
   const gpsStatusText = document.getElementById('gpsStatusText');
   const lapLenRow = document.getElementById('lapLenRow');
+  const motionToggle = document.getElementById('motionToggle');
+  const motionStatus = document.getElementById('motionStatus');
+  const motionStatusText = document.getElementById('motionStatusText');
+  const strideLenInput = document.getElementById('strideLen');
+  const strideLenRow = document.getElementById('strideLenRow');
 
   let running = false;
   let startTime = null;
@@ -398,6 +417,36 @@
   let gpsWatchId = null;
   let gpsDistanceMeters = 0;
   let gpsLastCoords = null;
+
+  // ---- GPS geofence auto-lap ----
+  // Outdoor mode: count a lap each time you leave the start anchor and return
+  // to it. Hysteresis (leave radius > enter radius) + a refractory window keep
+  // GPS jitter from double-counting.
+  const LEAVE_RADIUS = 15;      // metres you must travel away before a lap can count
+  const ENTER_RADIUS = 8;       // metres back within the anchor to close the lap
+  const MIN_AUTO_LAP_MS = 4000; // ignore auto-laps closer together than this
+  let lapAnchor = null;         // {lat, lon} recorded at the start of the session
+  let leftAnchor = false;
+  let lastAutoLapTime = 0;
+
+  // ---- Motion auto-detect + stride counting ----
+  // Optional: use the accelerometer (DeviceMotion) to auto-start when you begin
+  // moving and auto-pause when you stop, and — indoors, with GPS off — to count
+  // skating strides for a hands-free distance estimate. Off by default.
+  const motionSupported = (typeof DeviceMotionEvent !== 'undefined');
+  let motionEnabled = false;
+  let motionListening = false;
+  let motionIntervalId = null;
+  let gravEma = null;   // slow EMA of accel magnitude ≈ gravity/baseline
+  let jitter = 0;       // EMA of |dynamic accel| = motion energy
+  let movingState = false, movingSince = 0, stillSince = 0;
+  let manualPaused = false, pausedByAuto = false;
+  // Auto-detect thresholds (m/s²) with hysteresis, and hold windows (ms).
+  const START_THRESH = 1.3, STOP_THRESH = 0.5;
+  const START_HOLD = 1500, STOP_HOLD = 12000;
+  // Stride peak detection.
+  const STRIDE_PEAK = 2.4, STRIDE_RESET = 0.8, MIN_STRIDE_MS = 260;
+  let strideCount = 0, strideArmed = false, lastStrideTime = 0;
 
   function haversineMeters(a, b){
     const R = 6371000, toRad = d => d*Math.PI/180;
@@ -428,6 +477,7 @@
       if(seg >= minMove && seg <= 250) gpsDistanceMeters += seg;
     }
     gpsLastCoords = cur;
+    if(running) maybeAutoLapGps(cur);
     if(gpsEnabled) updateStats();
     setGpsStatus('GPS active · ±' + Math.round(accuracy || 0) + 'm', 'active');
   }
@@ -455,9 +505,12 @@
     gpsLastCoords = null;
   }
 
-  // Feet shown in the Distance stat: from GPS when enabled, else laps × length.
+  // Feet shown in the Distance stat. Source priority: GPS > stride count
+  // (indoor, motion on) > laps × length.
+  function strideLengthFt(){ return parseFloat(strideLenInput.value) || 5; }
   function currentDistanceFeet(){
     if(gpsEnabled) return gpsDistanceMeters * M_TO_FT;
+    if(motionEnabled && motionSupported && strideCount > 0) return strideCount * strideLengthFt();
     const lapLen = parseFloat(lapLengthInput.value) || 0;
     return lapLen * lapTimes.length;
   }
@@ -525,25 +578,41 @@
     lapBtn.textContent = `Tap on each lap ▸ ${lapTimes.length} lap${lapTimes.length===1?'':'s'}`;
   }
 
-  startBtn.onclick = () => {
-    if(!running){
-      running = true;
-      startTime = Date.now() - elapsedMs;
-      if(lapTimes.length === 0) lastLapMark = elapsedMs;
-      startBtn.textContent = 'Pause';
-      stopBtn.disabled = false;
-      resetBtn.disabled = false;
-      lapBtn.disabled = false;
-      timerLabel.textContent = 'Skating…';
-      if(gpsEnabled) startGps();
-      tick();
-    } else {
-      running = false;
-      cancelAnimationFrame(rafId);
-      startBtn.textContent = 'Resume';
-      timerLabel.textContent = 'Paused';
-      if(gpsEnabled){ stopGps(); setGpsStatus('Paused — GPS idle', 'acquiring'); }
+  function startRun(auto){
+    if(running) return;
+    // Fresh session (not a resume): clear per-session auto-tracking state.
+    if(elapsedMs === 0){
+      lapAnchor = null; leftAnchor = false; lastAutoLapTime = 0;
+      strideCount = 0; strideArmed = false; lastStrideTime = 0;
     }
+    running = true;
+    startTime = Date.now() - elapsedMs;
+    if(lapTimes.length === 0) lastLapMark = elapsedMs;
+    manualPaused = false;
+    pausedByAuto = false;
+    startBtn.textContent = 'Pause';
+    stopBtn.disabled = false;
+    resetBtn.disabled = false;
+    lapBtn.disabled = false;
+    timerLabel.textContent = 'Skating…';
+    if(gpsEnabled) startGps();
+    tick();
+  }
+
+  function pauseRun(auto){
+    if(!running) return;
+    running = false;
+    cancelAnimationFrame(rafId);
+    pausedByAuto = !!auto;
+    manualPaused = !auto;
+    startBtn.textContent = 'Resume';
+    timerLabel.textContent = auto ? 'Auto-paused — still' : 'Paused';
+    if(gpsEnabled){ stopGps(); setGpsStatus('Paused — GPS idle', 'acquiring'); }
+  }
+
+  startBtn.onclick = () => {
+    if(!running) startRun(false);
+    else pauseRun(false);
   };
 
   lapBtn.onclick = () => {
@@ -562,6 +631,10 @@
     lastLapMark = 0;
     stopGps();
     gpsDistanceMeters = 0;
+    lapAnchor = null; leftAnchor = false; lastAutoLapTime = 0;
+    strideCount = 0; strideArmed = false; lastStrideTime = 0;
+    manualPaused = false; pausedByAuto = false;
+    movingSince = 0; stillSince = 0; movingState = false;
     timerEl.textContent = '00:00';
     timerLabel.textContent = 'Ready to skate';
     startBtn.textContent = 'Start Session';
@@ -570,8 +643,9 @@
     lapBtn.disabled = true;
     trackProgress.setAttribute('stroke-dasharray','0 100');
     setDotPosition(0);
-    if(gpsEnabled) setGpsStatus('GPS ready — starts when you skate', 'acquiring');
+    if(gpsEnabled) setGpsStatus('GPS ready — auto distance + laps', 'acquiring');
     else hideGpsStatus();
+    if(motionEnabled) setMotionStatus('Ready — start skating to auto-begin', 'acquiring');
     updateStats();
   };
 
@@ -651,11 +725,12 @@
     lapLenRow.classList.toggle('muted', gpsEnabled);
     if(gpsEnabled){
       if(running) startGps();
-      else setGpsStatus('GPS ready — starts when you skate', 'acquiring');
+      else setGpsStatus('GPS ready — auto distance + laps', 'acquiring');
     } else {
       stopGps();
       hideGpsStatus();
     }
+    updateStrideRowVisibility();
     updateStats();
   });
 
@@ -666,9 +741,173 @@
         gpsToggle.checked = true;
         gpsEnabled = true;
         lapLenRow.classList.add('muted');
-        setGpsStatus('GPS ready — starts when you skate', 'acquiring');
+        setGpsStatus('GPS ready — auto distance + laps', 'acquiring');
       }
     }catch(e){}
+    updateStats();
+  }
+
+  // ---- Motion status line (mirrors the GPS status styling) ----
+  function setMotionStatus(text, kind){
+    motionStatus.hidden = false;
+    motionStatus.className = 'gps-status' +
+      (kind === 'err' ? ' err' : kind === 'acquiring' ? ' acquiring' : '');
+    motionStatusText.textContent = text;
+  }
+  function hideMotionStatus(){ motionStatus.hidden = true; }
+
+  function updateStrideRowVisibility(){
+    // Stride-length calibration only matters for indoor hands-free distance:
+    // motion on, GPS off.
+    strideLenRow.hidden = !(motionEnabled && !gpsEnabled && motionSupported);
+  }
+
+  // ---- GPS geofence auto-lap ----
+  function maybeAutoLapGps(cur){
+    if(!lapAnchor){ lapAnchor = cur; leftAnchor = false; return; }
+    const d = haversineMeters(lapAnchor, cur);
+    if(!leftAnchor){
+      if(d > LEAVE_RADIUS) leftAnchor = true;
+    } else if(d < ENTER_RADIUS){
+      const now = Date.now();
+      if(now - lastAutoLapTime > MIN_AUTO_LAP_MS){
+        const lapDur = elapsedMs - lastLapMark;
+        lapTimes.push(lapDur > 0 ? lapDur : 0);
+        lastLapMark = elapsedMs;
+        lastAutoLapTime = now;
+        leftAnchor = false;
+        updateStats();
+      }
+    }
+  }
+
+  // ---- Stride counting (indoor hands-free distance + derived laps) ----
+  function detectStride(dyn, now){
+    if(!strideArmed){
+      if(dyn > STRIDE_PEAK && (now - lastStrideTime) > MIN_STRIDE_MS){
+        strideArmed = true;
+        strideCount++;
+        lastStrideTime = now;
+        onStrideProgress();
+      }
+    } else if(dyn < STRIDE_RESET){
+      strideArmed = false;
+    }
+  }
+  function onStrideProgress(){
+    // Derive laps as cumulative stride distance crosses lap-length multiples,
+    // so avg/best lap and the ring cadence advance hands-free.
+    const lapLen = parseFloat(lapLengthInput.value) || 0;
+    if(lapLen > 0){
+      const targetLaps = Math.floor((strideCount * strideLengthFt()) / lapLen);
+      while(lapTimes.length < targetLaps){
+        const lapDur = elapsedMs - lastLapMark;
+        lapTimes.push(lapDur > 0 ? lapDur : 0);
+        lastLapMark = elapsedMs;
+      }
+    }
+    updateStats();
+  }
+
+  // ---- Accelerometer stream ----
+  function onMotion(e){
+    const a = e.accelerationIncludingGravity || e.acceleration;
+    if(!a) return;
+    const mag = Math.hypot(a.x || 0, a.y || 0, a.z || 0);
+    // Slow EMA tracks gravity + posture; subtracting it leaves dynamic motion.
+    gravEma = (gravEma == null) ? mag : gravEma + 0.05 * (mag - gravEma);
+    const dyn = mag - gravEma;
+    // Motion-energy EMA drives auto start/pause.
+    jitter = jitter + 0.1 * (Math.abs(dyn) - jitter);
+    // Count strides only while a run is active and stride distance is the source.
+    if(running && motionEnabled && !gpsEnabled) detectStride(dyn, Date.now());
+  }
+
+  // Evaluated on a timer so auto start/pause reacts to sustained state, not spikes.
+  function motionTick(){
+    if(!motionEnabled || !motionSupported) return;
+    const now = Date.now();
+    const moving = jitter > (movingState ? STOP_THRESH : START_THRESH);
+    movingState = moving;
+    if(moving){ stillSince = 0; if(!movingSince) movingSince = now; }
+    else { movingSince = 0; if(!stillSince) stillSince = now; }
+
+    if(!running){
+      if(!manualPaused && movingSince && (now - movingSince) >= START_HOLD){
+        startRun(true);
+        setMotionStatus(pausedByAuto ? 'Moving again — resumed' : 'Detected skating — started', 'active');
+      }
+    } else {
+      if(stillSince && (now - stillSince) >= STOP_HOLD){
+        pauseRun(true);
+        setMotionStatus('Still — auto-paused', 'acquiring');
+      }
+    }
+  }
+
+  async function enableMotion(){
+    if(!motionSupported){ setMotionStatus('This device has no motion sensor', 'err'); return false; }
+    // iOS 13+ gates DeviceMotion behind an explicit, gesture-triggered grant.
+    if(typeof DeviceMotionEvent.requestPermission === 'function'){
+      try{
+        const res = await DeviceMotionEvent.requestPermission();
+        if(res !== 'granted'){ setMotionStatus('Motion access denied', 'err'); return false; }
+      }catch(e){ setMotionStatus("Couldn't get motion access", 'err'); return false; }
+    }
+    if(!motionListening){ window.addEventListener('devicemotion', onMotion); motionListening = true; }
+    if(!motionIntervalId) motionIntervalId = setInterval(motionTick, 500);
+    return true;
+  }
+  function disableMotion(){
+    if(motionListening){ window.removeEventListener('devicemotion', onMotion); motionListening = false; }
+    if(motionIntervalId){ clearInterval(motionIntervalId); motionIntervalId = null; }
+    gravEma = null; jitter = 0; movingSince = 0; stillSince = 0; movingState = false;
+  }
+
+  motionToggle.addEventListener('change', async () => {
+    if(motionToggle.checked){
+      const ok = await enableMotion();
+      if(!ok){ motionToggle.checked = false; updateStrideRowVisibility(); return; }
+      motionEnabled = true;
+      try{ await storage.set('skate-setting:motion', '1'); }catch(e){}
+      setMotionStatus(running ? 'Watching your motion…' : 'Ready — start skating to auto-begin', 'acquiring');
+    } else {
+      motionEnabled = false;
+      disableMotion();
+      try{ await storage.set('skate-setting:motion', '0'); }catch(e){}
+      hideMotionStatus();
+    }
+    updateStrideRowVisibility();
+    updateStats();
+  });
+
+  async function initMotionSetting(){
+    try{
+      const res = await storage.get('skate-setting:motion');
+      if(res && res.value === '1'){
+        if(typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
+          // iOS: can't re-grant without a gesture, so arm on the first tap.
+          motionToggle.checked = true;
+          setMotionStatus('Tap anywhere to arm motion auto-detect', 'acquiring');
+          const arm = async () => {
+            document.removeEventListener('pointerdown', arm);
+            const ok = await enableMotion();
+            motionEnabled = ok;
+            if(ok) setMotionStatus(running ? 'Watching your motion…' : 'Ready — start skating to auto-begin', 'acquiring');
+            else motionToggle.checked = false;
+            updateStrideRowVisibility(); updateStats();
+          };
+          document.addEventListener('pointerdown', arm, { once: true });
+        } else if(motionSupported){
+          const ok = await enableMotion();
+          if(ok){
+            motionToggle.checked = true; motionEnabled = true;
+            setMotionStatus('Ready — start skating to auto-begin', 'acquiring');
+          }
+        }
+      }
+    }catch(e){}
+    updateStrideRowVisibility();
     updateStats();
   }
 
@@ -676,6 +915,7 @@
   updateStats();
   loadHistory();
   initGpsSetting();
+  initMotionSetting();
 })();
 </script>
 </body>
