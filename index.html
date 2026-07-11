@@ -230,10 +230,50 @@
     text-align:center;padding:20px 0;
   }
 
+  /* GPS auto-distance toggle */
+  .switch{position:relative;display:inline-block;width:46px;height:26px;flex:0 0 auto;}
+  .switch input{position:absolute;opacity:0;width:0;height:0;}
+  .switch .slider{
+    position:absolute;inset:0;cursor:pointer;border-radius:26px;
+    background:var(--surface-2);border:1px solid rgba(177,74,255,0.35);
+    transition:.2s;
+  }
+  .switch .slider::before{
+    content:"";position:absolute;height:18px;width:18px;left:3px;top:3px;
+    border-radius:50%;background:var(--text-dim);transition:.2s;
+  }
+  .switch input:checked + .slider{
+    background:rgba(38,245,224,0.22);border-color:var(--cyan);
+    box-shadow:0 0 12px rgba(38,245,224,0.4);
+  }
+  .switch input:checked + .slider::before{
+    transform:translateX(20px);background:var(--cyan);
+    box-shadow:0 0 8px rgba(38,245,224,0.7);
+  }
+  .switch input:focus-visible + .slider{outline:2px solid var(--cyan);outline-offset:2px;}
+  .gps-status{
+    margin-top:8px;padding:8px 12px;border-radius:10px;
+    background:var(--surface);border:1px solid rgba(38,245,224,0.25);
+    font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.03em;
+    color:var(--cyan);display:flex;align-items:center;gap:8px;
+  }
+  .gps-status[hidden]{display:none;}
+  .gps-status.err{border-color:rgba(255,46,154,0.4);color:var(--neon);}
+  .gps-status .dot{width:8px;height:8px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor;flex:0 0 auto;}
+  .gps-status.acquiring .dot{animation:gpspulse 1s ease-in-out infinite;}
+  @keyframes gpspulse{0%,100%{opacity:1;}50%{opacity:0.25;}}
+  .settings.muted{opacity:0.45;}
+  .gps-badge{
+    display:inline-block;font-family:'IBM Plex Mono',monospace;font-size:8px;
+    letter-spacing:0.08em;text-transform:uppercase;color:var(--cyan);
+    border:1px solid rgba(38,245,224,0.4);border-radius:4px;padding:1px 4px;margin-left:6px;
+  }
+
   @media (prefers-reduced-motion: reduce){
     .track-progress{transition:none;}
     button{transition:none;}
     .app-icon{animation:none;}
+    .gps-status.acquiring .dot{animation:none;}
   }
 </style>
 </head>
@@ -279,10 +319,19 @@
       <div class="stat"><div class="val" id="statBestLap">—</div><div class="lbl">Best Lap</div></div>
     </div>
 
-    <div class="settings">
+    <div class="settings" id="lapLenRow">
       <label for="lapLength">Rink lap length (ft)</label>
       <input type="number" id="lapLength" value="200" min="20" max="1600" step="5">
     </div>
+
+    <div class="settings">
+      <label for="gpsToggle">Auto-distance (GPS)</label>
+      <label class="switch">
+        <input type="checkbox" id="gpsToggle" aria-describedby="gpsStatus">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="gps-status" id="gpsStatus" hidden><span class="dot"></span><span id="gpsStatusText"></span></div>
   </div>
 
   <div class="history">
@@ -328,6 +377,10 @@
   const statBestLap = document.getElementById('statBestLap');
   const sessionCountEl = document.getElementById('sessionCount');
   const historyList = document.getElementById('historyList');
+  const gpsToggle = document.getElementById('gpsToggle');
+  const gpsStatus = document.getElementById('gpsStatus');
+  const gpsStatusText = document.getElementById('gpsStatusText');
+  const lapLenRow = document.getElementById('lapLenRow');
 
   let running = false;
   let startTime = null;
@@ -335,6 +388,79 @@
   let rafId = null;
   let lapTimes = []; // ms per lap
   let lastLapMark = 0;
+
+  // ---- GPS auto-distance ----
+  // Optional: measure distance from real movement via the Geolocation API
+  // instead of (lap length × laps). Off by default — indoor rinks have no
+  // usable GPS — but handy for outdoor tracks / open skating.
+  const M_TO_FT = 3.28084;
+  let gpsEnabled = false;
+  let gpsWatchId = null;
+  let gpsDistanceMeters = 0;
+  let gpsLastCoords = null;
+
+  function haversineMeters(a, b){
+    const R = 6371000, toRad = d => d*Math.PI/180;
+    const dLat = toRad(b.lat - a.lat), dLon = toRad(b.lon - a.lon);
+    const s = Math.sin(dLat/2)**2 +
+              Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLon/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(s));
+  }
+
+  function setGpsStatus(text, kind){ // kind: 'acquiring' | 'active' | 'err'
+    gpsStatus.hidden = false;
+    gpsStatus.className = 'gps-status' +
+      (kind === 'err' ? ' err' : kind === 'acquiring' ? ' acquiring' : '');
+    gpsStatusText.textContent = text;
+  }
+  function hideGpsStatus(){ gpsStatus.hidden = true; }
+
+  function onGpsPosition(pos){
+    const { latitude, longitude, accuracy } = pos.coords;
+    // Ignore low-confidence fixes so noise doesn't inflate distance.
+    if(accuracy != null && accuracy > 35){ setGpsStatus('Weak GPS signal…', 'acquiring'); return; }
+    const cur = { lat: latitude, lon: longitude };
+    if(gpsLastCoords){
+      const seg = haversineMeters(gpsLastCoords, cur);
+      // Only count movement above the fix's own noise floor, and reject
+      // implausible jumps (GPS spikes) above 250 m between updates.
+      const minMove = Math.max(1.5, (accuracy || 5) * 0.25);
+      if(seg >= minMove && seg <= 250) gpsDistanceMeters += seg;
+    }
+    gpsLastCoords = cur;
+    if(gpsEnabled) updateStats();
+    setGpsStatus('GPS active · ±' + Math.round(accuracy || 0) + 'm', 'active');
+  }
+  function onGpsError(err){
+    let msg = 'GPS unavailable — laps still work';
+    if(err && err.code === 1) msg = 'Location blocked — allow permission to auto-track';
+    else if(err && err.code === 3) msg = 'GPS timed out — searching…';
+    setGpsStatus(msg, 'err');
+  }
+  function startGps(){
+    if(!('geolocation' in navigator)){
+      setGpsStatus('This device has no GPS — laps still work', 'err');
+      return;
+    }
+    gpsLastCoords = null;
+    setGpsStatus('Acquiring GPS…', 'acquiring');
+    try{
+      gpsWatchId = navigator.geolocation.watchPosition(onGpsPosition, onGpsError, {
+        enableHighAccuracy:true, maximumAge:1000, timeout:15000
+      });
+    }catch(e){ setGpsStatus("Couldn't start GPS — laps still work", 'err'); }
+  }
+  function stopGps(){
+    if(gpsWatchId != null){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId = null; }
+    gpsLastCoords = null;
+  }
+
+  // Feet shown in the Distance stat: from GPS when enabled, else laps × length.
+  function currentDistanceFeet(){
+    if(gpsEnabled) return gpsDistanceMeters * M_TO_FT;
+    const lapLen = parseFloat(lapLengthInput.value) || 0;
+    return lapLen * lapTimes.length;
+  }
 
   // Ellipse perimeter (Ramanujan approx) for the oval path, radii 170/90
   const rx = 170, ry = 90;
@@ -386,9 +512,7 @@
   }
 
   function updateStats(){
-    const lapLen = parseFloat(lapLengthInput.value) || 0;
-    const distance = lapLen * lapTimes.length;
-    statDistance.textContent = distance.toFixed(0);
+    statDistance.textContent = currentDistanceFeet().toFixed(0);
     if(lapTimes.length){
       const avg = lapTimes.reduce((a,b)=>a+b,0)/lapTimes.length;
       statAvgLap.textContent = fmtLap(avg);
@@ -410,12 +534,14 @@
       resetBtn.disabled = false;
       lapBtn.disabled = false;
       timerLabel.textContent = 'Skating…';
+      if(gpsEnabled) startGps();
       tick();
     } else {
       running = false;
       cancelAnimationFrame(rafId);
       startBtn.textContent = 'Resume';
       timerLabel.textContent = 'Paused';
+      if(gpsEnabled){ stopGps(); setGpsStatus('Paused — GPS idle', 'acquiring'); }
     }
   };
 
@@ -433,6 +559,8 @@
     elapsedMs = 0;
     lapTimes = [];
     lastLapMark = 0;
+    stopGps();
+    gpsDistanceMeters = 0;
     timerEl.textContent = '00:00';
     timerLabel.textContent = 'Ready to skate';
     startBtn.textContent = 'Start Session';
@@ -441,6 +569,8 @@
     lapBtn.disabled = true;
     trackProgress.setAttribute('stroke-dasharray','0 100');
     setDotPosition(0);
+    if(gpsEnabled) setGpsStatus('GPS ready — starts when you skate', 'acquiring');
+    else hideGpsStatus();
     updateStats();
   };
 
@@ -448,13 +578,13 @@
     if(elapsedMs < 1000){ resetBtn.onclick(); return; }
     running = false;
     cancelAnimationFrame(rafId);
-    const lapLen = parseFloat(lapLengthInput.value) || 0;
     const session = {
       id: 'session_' + Date.now(),
       date: new Date().toISOString(),
       durationMs: elapsedMs,
       laps: lapTimes.length,
-      distance: lapLen * lapTimes.length,
+      distance: currentDistanceFeet(),
+      gps: gpsEnabled,
       avgLapMs: lapTimes.length ? lapTimes.reduce((a,b)=>a+b,0)/lapTimes.length : null,
       bestLapMs: lapTimes.length ? Math.min(...lapTimes) : null
     };
@@ -492,7 +622,7 @@
         div.innerHTML = `
           <div class="hist-left">
             <div class="date">${dateStr} · ${timeStr}</div>
-            <div class="summary">${fmtTime(s.durationMs)} · ${s.laps} lap${s.laps===1?'':'s'} · ${s.distance.toFixed(0)}ft</div>
+            <div class="summary">${fmtTime(s.durationMs)} · ${s.laps} lap${s.laps===1?'':'s'} · ${s.distance.toFixed(0)}ft${s.gps ? '<span class="gps-badge">GPS</span>' : ''}</div>
           </div>
           <div class="hist-right">
             ${s.avgLapMs ? 'avg '+fmtLap(s.avgLapMs) : ''}
@@ -514,9 +644,37 @@
     }
   }
 
+  gpsToggle.addEventListener('change', async () => {
+    gpsEnabled = gpsToggle.checked;
+    try{ await storage.set('skate-setting:gps', gpsEnabled ? '1' : '0'); }catch(e){}
+    lapLenRow.classList.toggle('muted', gpsEnabled);
+    if(gpsEnabled){
+      if(running) startGps();
+      else setGpsStatus('GPS ready — starts when you skate', 'acquiring');
+    } else {
+      stopGps();
+      hideGpsStatus();
+    }
+    updateStats();
+  });
+
+  async function initGpsSetting(){
+    try{
+      const res = await storage.get('skate-setting:gps');
+      if(res && res.value === '1'){
+        gpsToggle.checked = true;
+        gpsEnabled = true;
+        lapLenRow.classList.add('muted');
+        setGpsStatus('GPS ready — starts when you skate', 'acquiring');
+      }
+    }catch(e){}
+    updateStats();
+  }
+
   setDotPosition(0);
   updateStats();
   loadHistory();
+  initGpsSetting();
 })();
 </script>
 </body>
